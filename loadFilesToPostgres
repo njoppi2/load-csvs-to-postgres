@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import argparse
+import pandas as pd
+import psycopg2
+from sqlalchemy import create_engine
+from decouple import config
+import io
+import logging
+
+logging.basicConfig(level=logging.INFO)
+
+def list_csv_files(folder_path, recursive=False):
+    csv_files = []
+    if recursive:
+        for root, dirs, files in os.walk(folder_path):
+            for file in files:
+                if file.endswith(".csv"):
+                    csv_files.append(os.path.join(root, file))
+    else:
+        for file in os.listdir(folder_path):
+            if file.endswith(".csv"):
+                csv_files.append(os.path.join(folder_path, file))
+    return csv_files
+
+def create_database(db_name, db_params):
+    connection = psycopg2.connect(**db_params)
+    cursor = connection.cursor()
+
+    try:
+        # Disable autocommit mode to create a database
+        connection.autocommit = True
+
+        # Create a new database if it doesn't exist
+        cursor.execute(f"CREATE DATABASE {db_name}")
+
+        # Re-enable autocommit mode for subsequent operations
+        connection.autocommit = False
+
+        connection.commit()
+        print(f"Connected to database '{db_name}'.")
+
+    except psycopg2.Error as e:
+        print(f"Didn't create database: {e}")
+
+    finally:
+        cursor.close()
+        connection.close()
+
+
+def load_csv_to_postgres(csv_file_path: str, table_name: str, engine) -> None:
+    DELIMITER = ';'
+
+    try:
+        # Read CSV file into a pandas DataFrame
+        df = pd.read_csv(csv_file_path, delimiter=DELIMITER)
+
+        # Drop old table and create a new empty table
+        df.head(0).to_sql(table_name, engine, if_exists='replace', index=False)
+
+        for chunk in pd.read_csv(csv_file_path, delimiter=DELIMITER, chunksize=1000):
+            connection = engine.raw_connection()
+            cursor = connection.cursor()
+            output = io.StringIO()
+            chunk.to_csv(output, sep=DELIMITER, header=False, index=False)
+            output.seek(0)
+            cursor.copy_from(output, table_name, null="", sep=DELIMITER) # null values become ''
+            connection.commit()
+            cursor.close()
+            connection.close()
+    
+        logging.info(f"Data loaded into table '{table_name}' in the target database.")
+
+    except Exception as e:
+        logging.error(f"Error loading data into table '{table_name}': {str(e)}")
+        raise
+
+def main():
+    parser = argparse.ArgumentParser(description="Load CSV files into PostgreSQL.")
+    parser.add_argument("folder_path", help="Path to the folder to search in")
+    parser.add_argument("-r", "--recursive", action="store_true", help="Search recursively")
+    args = parser.parse_args()
+
+    folder_path = args.folder_path
+    recursive = args.recursive
+    absolute_path = os.path.abspath(folder_path)
+
+    db_name = input("Database name: ")
+
+    db_params = {
+        'dbname': config('DB_NAME'),
+        'user': config('DB_USER'),
+        'password': config('DB_PASSWORD'),
+        'host': config('DB_HOST'),
+        'port': config('DB_PORT'),
+    }
+
+    engine = create_engine(
+        f'postgresql://{config("DB_USER")}:{config("DB_PASSWORD")}@{config("DB_HOST")}:{config("DB_PORT")}/{db_name}')
+
+    csv_files = list_csv_files(absolute_path, recursive)
+    if not csv_files:
+        logging.error("No CSV files found in the specified folder.")
+        sys.exit(1)
+
+    create_database(db_name, db_params)
+
+    for csv_file_path in csv_files:
+        table_name = os.path.splitext(os.path.basename(csv_file_path))[0]
+        load_csv_to_postgres(csv_file_path, table_name, engine)
+
+if __name__ == "__main__":
+    main()
