@@ -10,65 +10,61 @@ from decouple import config
 import io
 import logging
 
+# Constants should be in all caps and at the top of the file
+DELIMITER = ';'
+FILE_EXTENSION = '.csv'
+
+# Set up logging to show info messages and above (CRITICAL, ERROR, etc)
 logging.basicConfig(level=logging.INFO)
+
+# Custom exception for customizable error handling
+class NoInput(Exception):
+    pass
 
 def list_csv_files(folder_path, recursive=False):
     csv_files = []
     for root, dirs, files in os.walk(folder_path):
         for file in files:
-            if file.endswith(".csv"):
+            if file.endswith(FILE_EXTENSION):
                 csv_files.append(os.path.join(root, file))
         if not recursive:
             break  # Stop if not recursive
     return csv_files
 
 def create_database(db_name, db_params):
-    connection = psycopg2.connect(**db_params)
-    cursor = connection.cursor()
-
     try:
-        # Disable autocommit mode to create a database
+        connection = psycopg2.connect(**db_params)  # Cant use "with" here because "CREATE DATABASE" complains about transaction block
         connection.autocommit = True
-
-        # Create a new database if it doesn't exist
-        cursor.execute(f"CREATE DATABASE {db_name}")
-
-        # Re-enable autocommit mode for subsequent operations
-        connection.autocommit = False
-
-        connection.commit()
+        with connection.cursor() as cursor:
+            # Create a new database if it doesn't exist
+            cursor.execute(f"CREATE DATABASE {db_name}")
+            connection.commit()
         print(f"Connected to database '{db_name}'.")
-
+    except psycopg2.errors.DuplicateDatabase as e:
+        logging.info(f"{e}")
     except psycopg2.Error as e:
-        print(f"Didn't create database: {e}")
-
+        raise logging.error(f"Error creating database: {e}")
+    except Exception as e:
+        raise logging.error(f"An error unrelated to psycopg2 happened: {e}")
     finally:
-        cursor.close()
         connection.close()
 
 def load_csv_to_postgres(csv_file_path: str, table_name: str, engine) -> None:
-    DELIMITER = ';'
-
     try:
-        # Read CSV file into a pandas DataFrame
         df = pd.read_csv(csv_file_path, delimiter=DELIMITER)
-
-        # Drop old table and create a new empty table
         df.head(0).to_sql(table_name, engine, if_exists='replace', index=False)
-
+    
         with engine.begin() as connection: # "with" doesn't work with engine.raw_connection()
             with connection.connection.cursor() as cursor:
                 for chunk in pd.read_csv(csv_file_path, delimiter=DELIMITER, chunksize=1000):
                     output = io.StringIO()
                     chunk.to_csv(output, sep=DELIMITER, header=False, index=False)
                     output.seek(0)
-                    cursor.copy_from(output, table_name, null="", sep=DELIMITER)  # null values become ''
+                    cursor.copy_from(output, table_name, null="", sep=DELIMITER)
     
         logging.info(f"Data loaded into table '{table_name}' in the target database.")
-
     except Exception as e:
-        logging.error(f"Error loading data into table '{table_name}': {str(e)}")
-        raise
+        raise logging.error(f"Error loading data into table '{table_name}': {str(e)}")
 
 def main():
     parser = argparse.ArgumentParser(description="Load CSV files into PostgreSQL.")
@@ -80,7 +76,16 @@ def main():
     recursive = args.recursive
     absolute_path = os.path.abspath(folder_path)
 
-    db_name = input("Database name: ")
+    try:
+        db_name = input("Database name: ")
+        if not db_name:
+            raise NoInput("Database name cannot be empty.")  # I created a custom exception for this
+    except NoInput as e:
+        logging.error(e)
+        sys.exit(1)
+    except Exception as e:
+        logging.error(f"An error occured: {e}")
+        sys.exit(1)
 
     db_params = {
         'dbname': config('DB_NAME'),
